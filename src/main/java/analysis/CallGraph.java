@@ -27,6 +27,14 @@ public class CallGraph {
     edges.addAll(cg.edges);
   }
 
+  public Set<MethodSignature> getNodes() {
+    return this.nodes;
+  }
+
+    public Set<Edge<MethodSignature, MethodSignature>> getEdges() {
+        return this.edges;
+    }
+
   public void addNode(@Nonnull MethodSignature method) {
     if (nodes.contains(method)) {
       throw new IllegalArgumentException(

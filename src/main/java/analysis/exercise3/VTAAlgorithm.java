@@ -7,6 +7,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 
+import analysis.exercise1.CHAAlgorithm;
 import org.graphstream.algorithm.TarjanStronglyConnectedComponents;
 import org.graphstream.graph.Graph;
 import org.graphstream.graph.Node;
@@ -14,13 +15,18 @@ import org.graphstream.graph.implementations.MultiGraph;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import sootup.core.jimple.basic.Value;
+import sootup.core.jimple.common.expr.JCastExpr;
+import sootup.core.jimple.common.expr.JNewExpr;
+import sootup.core.jimple.common.expr.JStaticInvokeExpr;
 import sootup.core.jimple.common.ref.JFieldRef;
+import sootup.core.jimple.common.ref.JStaticFieldRef;
+import sootup.core.jimple.common.stmt.JAssignStmt;
 import sootup.core.jimple.common.stmt.JInvokeStmt;
 import sootup.core.jimple.common.stmt.Stmt;
 import sootup.core.signatures.MethodSignature;
-import sootup.core.typehierarchy.TypeHierarchy;
 import sootup.core.types.ClassType;
 import sootup.java.core.JavaSootMethod;
+import sootup.java.core.jimple.basic.JavaLocal;
 import sootup.java.core.views.JavaView;
 
 public class VTAAlgorithm extends CallGraphAlgorithm {
@@ -34,11 +40,154 @@ public class VTAAlgorithm extends CallGraphAlgorithm {
     }
 
     @Override
-    protected void populateCallGraph(@Nonnull JavaView view, @Nonnull CallGraph cg) {
-        // Get all entry points (methods considered as starting points for the analysis)
+    public void populateCallGraph(@Nonnull JavaView view, @Nonnull CallGraph cg) {
+
+        final CHAAlgorithm chaCg  = new CHAAlgorithm();
+        chaCg.populateCallGraph(view, cg);
+
+        final Collection<MethodSignature> entryPoints = getEntryPoints(view).collect(Collectors.toList());
+        cg.getNodes().clear();
+        cg.getEdges().clear();
+
+        for (final MethodSignature entryPoint : entryPoints) {
+            processMethod(entryPoint, view, cg);
+        }
+    }
+
+    private void processMethod(final @Nonnull MethodSignature method, final @Nonnull JavaView view, final @Nonnull CallGraph cg) {
+
+        //create TAG for every var and then, iterate again to process the invokes
+
+        final Optional<JavaSootMethod> javaMethodOpt = view.getMethod(method);
+        if (!javaMethodOpt.isPresent()) {
+            return;
+        }
+
+        final JavaSootMethod javaMethod = javaMethodOpt.get();
+        if (!javaMethod.hasBody()) {
+            return;
+        }
+
+        final TypeAssignmentGraph tag = new TypeAssignmentGraph();
+
+        for (final Stmt instruction : javaMethod.getBody().getStmts()) {
+
+            MethodSignature invocation = null;
+            if (instruction instanceof JAssignStmt) {
+                final JAssignStmt assignStmt = (JAssignStmt) instruction;
+                Value leftOp = assignStmt.getLeftOp();
+                tag.addNode(leftOp);
+                if (assignStmt.getRightOp() instanceof JNewExpr) {
+                    tag.tagNode(leftOp, ((JNewExpr) assignStmt.getRightOp()).getType());
+                }
+                if (assignStmt.getRightOp() instanceof JavaLocal) {
+                    tag.addNode(assignStmt.getRightOp());
+                    if (!tag.containsEdge(assignStmt.getRightOp(), leftOp)) {
+                        tag.addEdge(assignStmt.getRightOp(), leftOp);
+                    }
+                }
+                if (assignStmt.getRightOp() instanceof JStaticInvokeExpr) {
+                    invocation = ((JStaticInvokeExpr) assignStmt.getRightOp()).getMethodSignature();
+                    if (view.getMethod(invocation).isPresent()) {
+                        for (final Stmt staticInstruction : view.getMethod(invocation).get().getBody().getStmts()) {
+                            if (staticInstruction instanceof JInvokeStmt) {
+                                if (staticInstruction.getInvokeExpr().getMethodSignature().getName().equals("<init>")) {
+                                    tag.tagNode(leftOp, staticInstruction.getInvokeExpr().getMethodSignature().getDeclClassType());
+                                }
+                            }
+
+                        }
+                    }
+                }
+                if (assignStmt.getRightOp() instanceof JCastExpr) {
+                    tag.tagNode(leftOp, (ClassType) assignStmt.getRightOp().getType());
+                    if (!tag.containsEdge(((JCastExpr) assignStmt.getRightOp()).getOp(), leftOp)) {
+                        tag.addEdge(((JCastExpr) assignStmt.getRightOp()).getOp(), leftOp);
+                    }
+                }
+                if (assignStmt.getRightOp() instanceof JStaticFieldRef) {
+                    if (!tag.containsEdge(assignStmt.getRightOp(), leftOp)) {
+                        tag.addEdge(assignStmt.getRightOp(), leftOp);
+                    }
+                }
+            }
+        }
+
+        tag.annotateScc();
+
+        //propagating the types of the nodes to the targets
+        tag.graph.getNodeSet().stream().collect(Collectors.toList()).forEach(n -> {
+            Set<Value> tars = tag.getTargetsFor(n.getAttribute("value"));
+            tars.stream().collect(Collectors.toList()).forEach(t -> {
+                tag.tagNode(t, tag.getNodeTags(n.getAttribute("value")).stream().collect(Collectors.toList()).get(0));
+            });
+        });
+
+//        final List<String> temp = new ArrayList<>();
+//        tag.graph.getNodeSet().stream().collect(Collectors.toList()).forEach(n -> {
+//            temp.add(n.getAttribute("value").toString());
+//        });
+//        tag.graph.getEdgeSet().stream().collect(Collectors.toList()).forEach(n -> {
+//            temp.add(n.getSourceNode().getAttribute("value").toString()+"--" +n.getTargetNode().getAttribute("value").toString());
+//        });
+
+        tag.getTaggedNodes();
+//        cg.getNodes().clear();
+//        cg.getEdges().clear();
+
+        processInvokes(view, method, cg, tag);
 
     }
 
+    private void processInvokes(final @Nonnull JavaView view, final @Nonnull MethodSignature method, final @Nonnull CallGraph cg, final TypeAssignmentGraph tag) {
+
+        final Optional<JavaSootMethod> javaMethodOpt = view.getMethod(method);
+        if (!javaMethodOpt.isPresent()) {
+            return;
+        }
+
+        final JavaSootMethod javaMethod = javaMethodOpt.get();
+        if (!javaMethod.hasBody()) {
+            return;
+        }
+
+        for (final Stmt instruction : javaMethod.getBody().getStmts()) {
+
+            if (instruction instanceof JInvokeStmt) {
+                if (instruction.getInvokeExpr().getMethodSignature().getName().equals("<init>")) {
+                    continue;
+                }
+                if (!cg.hasNode(method)) {
+                    cg.addNode(method);
+                }
+                final JInvokeStmt invokeStmt = (JInvokeStmt) instruction;
+                final Value base = invokeStmt.getInvokeExpr().getUses().collect(Collectors.toList()).get(0);
+
+                //creating cg edge for the base
+                final Set<ClassType> baseClassTypes = tag.getNodeTags(base);
+                addCgEdge(cg, baseClassTypes, invokeStmt, method);
+
+                //creating cg edge for all the targets of the base (for alias)
+                final Set<Value> targets = tag.getTargetsFor(base);
+                for (final Value target : targets) {
+                    final Set<ClassType> classTypes = tag.getNodeTags(target);
+                    addCgEdge(cg, classTypes, invokeStmt, method);
+                }
+            }
+        }
+    }
+
+    private void addCgEdge(final CallGraph cg, final Set<ClassType> classTypes, final JInvokeStmt invokeStmt, final MethodSignature method) {
+        for (final ClassType classType : classTypes) {
+            final MethodSignature newMethodSignature = formNewMethodSignature(invokeStmt.getInvokeExpr().getMethodSignature(), classType);
+            if (!cg.hasNode(newMethodSignature)) {
+                cg.addNode(newMethodSignature);
+            }
+            if (!cg.hasEdge(method, newMethodSignature)) {
+                cg.addEdge(method, newMethodSignature);
+            }
+        }
+    }
 
     static class Pair<A, B> {
         final A first;
@@ -175,4 +324,14 @@ public class VTAAlgorithm extends CallGraphAlgorithm {
             graph.display();
         }
     }
+
+    private MethodSignature formNewMethodSignature(final MethodSignature original, final ClassType newDeclClassType) {
+        return new MethodSignature(
+                newDeclClassType,
+                original.getName(),
+                original.getParameterTypes(),
+                original.getType()
+        );
+    }
+
 }
